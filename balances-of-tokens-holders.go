@@ -13,8 +13,8 @@ import (
 )
 
 func init() {
-	balancesOfTokensHolders.PersistentFlags().StringVar(&token, "token", "", "")
-	_ = balancesOfTokensHolders.MarkPersistentFlagRequired("token")
+	balancesOfTokensHolders.PersistentFlags().StringVar(&tokenAddress, "tokenAddress", "", "")
+	_ = balancesOfTokensHolders.MarkPersistentFlagRequired("tokenAddress")
 
 	balancesOfTokensHolders.PersistentFlags().IntVar(&minTokenQnt, "minTokenQnt", 100, "")
 	_ = balancesOfTokensHolders.MarkPersistentFlagRequired("minTokenQnt")
@@ -32,7 +32,7 @@ const (
 
 var (
 	cfg                   config.Config
-	token                 string
+	tokenAddress          string
 	minTokenQnt           int
 	minHoldingUSDValueStr string
 	whaleThresholdStr     string
@@ -42,8 +42,11 @@ type statistics struct {
 	holdersAnalyzed int
 }
 
-//TODO
+// TODO
 // support 5 requests per second limit
+
+// TODO
+// handle pagination
 
 var balancesOfTokensHolders = &cobra.Command{
 	Use:   "balancesOfTokensHolders",
@@ -84,7 +87,7 @@ var balancesOfTokensHolders = &cobra.Command{
 		whales := make(map[string]struct{}, 0)
 
 		for _, chain := range cfg.Chains {
-			holders, err := apiClient.GetTokenHolders(apiclient.Chain(chain), token)
+			holders, err := apiClient.GetTokenHolders(apiclient.Chain(chain), tokenAddress)
 			if err != nil {
 				log.Fatalf("error retrieving token holders for chain %v: %v", chain, err)
 			}
@@ -95,7 +98,6 @@ var balancesOfTokensHolders = &cobra.Command{
 					log.Fatalf("error retrieving balances for chain %v, address: %v; %v", chain, holder.Address, err)
 				}
 			}
-
 		}
 
 		log.Println()

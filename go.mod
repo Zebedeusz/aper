@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/AlchemistsLab/govalent v0.0.0-20210531145438-33f150cabb70 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/inconshreveable/mousetrap v1.0.1 // indirect
