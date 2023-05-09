@@ -3,7 +3,11 @@ package apiclient
 import (
 	"aper/config"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io/ioutil"
+	"net/http"
 	"strings"
 	"time"
 
@@ -13,14 +17,20 @@ import (
 )
 
 type APIClienter interface {
-	GetTokenHolders(chain Chain, token string) ([]class_a.Portfolio, error)
+	GetTokenHolders(chain Chain, token string, block *int) ([]class_a.Portfolio, error)
 	GetAddressBalances(req GetAddressBalancesReq) ([]class_a.Portfolio, error)
 	GetAddressBalancesRateLimited(ctx context.Context, req GetAddressBalancesReq) ([]class_a.Portfolio, error)
+	GetBlockByDate(req GetBlockByDateReq) (*int, error)
 }
 
 type GetAddressBalancesReq struct {
 	Chain   Chain
 	Address string
+}
+
+type GetBlockByDateReq struct {
+	Chain Chain
+	Date  time.Time
 }
 
 func (c *ApiClient) GetAddressBalancesRateLimited(ctx context.Context, req GetAddressBalancesReq) ([]class_a.Portfolio, error) {
@@ -39,20 +49,25 @@ func NewAPIClient(cfg *config.Config) APIClienter {
 	govalent.APIKey = cfg.ApiKey
 	return &ApiClient{
 		cfg:                 *cfg,
-		balancesReqsLimiter: rate.NewLimiter(rate.Every(time.Millisecond*20), 1),
+		balancesReqsLimiter: rate.NewLimiter(rate.Every(time.Millisecond*50), 1),
 	}
 }
 
-func (c *ApiClient) GetTokenHolders(chain Chain, tokenAddress string) ([]class_a.Portfolio, error) {
+func (c *ApiClient) GetTokenHolders(chain Chain, tokenAddress string, block *int) ([]class_a.Portfolio, error) {
 	chainID, ok := Chains[chain]
 	if !ok {
 		return nil, errors.New("not supported chain")
 	}
 
+	params := class_a.TokenHoldersWithHeightParams{
+		PageSize: 500,
+	}
+	if block != nil {
+		params.BlockHeight = fmt.Sprint(*block)
+	}
+
 retry:
-	portfolios, err := govalent.ClassA().TokenHolders(chainID, tokenAddress, class_a.PaginateParams{
-		PageSize: 300,
-	})
+	portfolios, err := govalent.ClassA().TokenHolders(chainID, tokenAddress, params)
 	if err != nil {
 		if isAPITempError(err) {
 			goto retry
@@ -79,6 +94,7 @@ retry:
 	})
 	if err != nil {
 		if isAPITempError(err) || isRateLimitExceededError(err) {
+			fmt.Printf("error retrieving balances: %s, retrying...\n", err)
 			time.Sleep(time.Second / 2)
 			goto retry
 		}
@@ -108,4 +124,37 @@ func isAPITempError(err error) bool {
 		return true
 	}
 	return false
+}
+
+func (c *ApiClient) GetBlockByDate(req GetBlockByDateReq) (*int, error) {
+	date := req.Date.Format("2006-01-02")
+	url := fmt.Sprintf("https://deep-index.moralis.io/api/v2/dateToBlock?chain=%s&date=%s", MoralisChain[req.Chain], date)
+
+	r, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	r.Header.Add("Accept", "application/json")
+	r.Header.Add("X-API-Key", c.cfg.MoralisApiKey)
+
+	res, err := http.DefaultClient.Do(r)
+	if err != nil {
+		return nil, err
+	}
+
+	defer res.Body.Close()
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyMap := make(map[string]interface{})
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		return nil, err
+	}
+
+	block := int(bodyMap["block"].(float64))
+
+	return &block, nil
 }

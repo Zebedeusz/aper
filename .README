@@ -1,0 +1,23 @@
+DXP/VELA
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x88aa4a6c5050b9a1b2aa7e34d0582025ca6ab745 --tokenChain ETHEREUM --whaleThreshold 100000
+
+GMX
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a --tokenChain ARBITRUM  --whaleThreshold 100000 --date 2021-12-28
+
+GIGA
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x83249c6794bca5a77eb8c0af9f1a86e055459cea --tokenChain ETHEREUM --whaleThreshold 100000   
+
+Y2K
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x65c936f008BC34fE819bce9Fa5afD9dc2d49977f --tokenChain ARBITRUM --whaleThreshold 100000 --date 2023-03-03
+
+UNIDEX ETH
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x95b3497bbcccc46a8f45f5cf54b0878b39f8d96c --tokenChain ETHEREUM --whaleThreshold 100000 --date 2022-10-17
+
+UNIDEX FANTOM
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x2130d2a1e51112d349ccf78d2a1ee65843ba36e0 --tokenChain FANTOM --whaleThreshold 100000 --date 2022-10-17
+
+GRAIL
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x3d9907f9a368ad0a51be60f7da3b97cf940982d8 --tokenChain ARBITRUM --whaleThreshold 100000 --date 2023-06-23
+
+GAMMA
+go run main.go balancesOfTokensHolders --minHoldingUSDValue 100 --minTokenQnt 100 --tokenAddress 0x6bea7cfef803d1e3d5f7c0103f7ded065644e197 --tokenChain ETHEREUM --whaleThreshold 100000 --date 2023-03-12

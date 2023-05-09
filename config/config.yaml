@@ -1,7 +1,8 @@
 apiKey: ckey_dd64cc8c99c34377a953d53e113
+moralisApiKey: hi1F51P4we4JShmhcVIPOullsHahRS62jJGe4OqncoZirnyJZtTfI8b1BfQMXWSN
 chains:
   - ETHEREUM
-  - MATIC
+  # - MATIC
   - ARBITRUM
-  - AVALANCHE
+  # - AVALANCHE
   - FANTOM

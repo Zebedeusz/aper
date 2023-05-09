@@ -10,11 +10,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cshields143/govalent/class_a"
+	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -35,14 +37,18 @@ func init() {
 
 	balancesOfTokensHolders.PersistentFlags().StringVar(&whaleThresholdStr, "whaleThreshold", "", "")
 	_ = balancesOfTokensHolders.MarkPersistentFlagRequired("whaleThreshold")
+
+	balancesOfTokensHolders.PersistentFlags().StringVar(&date, "date", "", "")
 }
 
 const (
 	configPath            = "/Users/michal.gil/go/src/aper/config/config.yaml"
 	coingeckoURL          = "https://www.coingecko.com/en/coins/%s"
 	coingeckoCoinsListURL = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
+	coingeckoCoinURL      = "https://api.coingecko.com/api/v3/coins/%s?localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false"
 	resultsPathTokens     = "./results/tokens"
 	resultsPathWhales     = "./results/whales"
+	dateFormat            = "2006-01-02"
 )
 
 var (
@@ -53,14 +59,14 @@ var (
 	minTokenQnt                              int
 	minHoldingUSDValueStr, whaleThresholdStr string
 	minHoldingUSDValue, whaleThreshold       decimal.Decimal
-	coingeckoTokensMap                       = make(map[apiclient.Chain]map[string]string) // chain to token symbol to coingecko token ID
 	apiClient                                apiclient.APIClienter
+	date                                     string
 )
 
-// what do I need to know about a token:
-// - website
-// - total supply / max supply
-// - all time price chart
+type coins struct {
+	lock               *sync.RWMutex
+	coingeckoTokensMap map[apiclient.Chain]map[string]*tokenInfo // chain to token symbol to token info
+}
 
 type whales struct {
 	lock *sync.RWMutex
@@ -69,7 +75,7 @@ type whales struct {
 
 type holdings struct {
 	lock *sync.RWMutex
-	list map[string]struct{} // token symbol
+	list map[string]decimal.Decimal // token symbol to quote to be able to sort
 }
 
 var balancesOfTokensHolders = &cobra.Command{
@@ -92,14 +98,44 @@ var balancesOfTokensHolders = &cobra.Command{
 
 		tokenChainC := apiclient.Chain(tokenChain)
 
-		go initCoingeckoTokensMap()
+		var block *int
+		if date != "" {
+			dateTime, err := time.Parse(dateFormat, date)
+			if err != nil {
+				log.Fatalf("error parsing date %v: %v", date, err)
+			}
+			block, err = apiClient.GetBlockByDate(apiclient.GetBlockByDateReq{
+				Chain: tokenChainC,
+				Date:  dateTime,
+			})
+			log.Printf("block: %d", *block)
+			if err != nil {
+				log.Fatalf("error retrieving block by date: %v", err)
+			}
+			if block == nil {
+				log.Fatal("no block found for given date")
+			}
+		}
+
+		coins := coins{
+			lock:               &sync.RWMutex{},
+			coingeckoTokensMap: make(map[apiclient.Chain]map[string]*tokenInfo),
+		}
+
+		// saveCoingeckoTokensList(coins)
+		// os.Exit(0)
+
+		initCoingeckoTokensMap(coins)
 
 		fmt.Printf("Retrieving holders...\n")
-		holders, err := apiClient.GetTokenHolders(apiclient.Chain(tokenChainC), tokenAddress)
+		holders, err := apiClient.GetTokenHolders(apiclient.Chain(tokenChainC), tokenAddress, block)
 		if err != nil {
 			log.Fatalf("error retrieving token holders for address %v: %v", tokenAddress, err)
 		}
 		fmt.Printf("Found %d holders\n", len(holders))
+		if len(holders) == 0 {
+			log.Fatal("Exiting...")
+		}
 
 		tokenSymbol = holders[0].ContractTickerSymbol
 
@@ -114,7 +150,7 @@ var balancesOfTokensHolders = &cobra.Command{
 
 			holdings := holdings{
 				lock: &sync.RWMutex{},
-				list: make(map[string]struct{}, 0),
+				list: make(map[string]decimal.Decimal, 0),
 			}
 
 			for _, holder := range holders {
@@ -126,19 +162,19 @@ var balancesOfTokensHolders = &cobra.Command{
 				holderAddress := holder.Address
 
 				go func() {
-					processHolder(holderAddress, chain, holdings, whales)
+					processHolder(holderAddress, chain, holdings, whales, coins)
 					wg.Done()
 				}()
 			}
 			wg.Wait()
-			saveFoundTokensInAFile(chain, holdings.list)
+			saveFoundTokensInAFile(chain, holdings.list, coins)
 		}
 		saveFoundWhalesInAFile(whales.list)
 		return nil
 	},
 }
 
-func processHolder(holderAddress, chain string, holdings holdings, whales whales) {
+func processHolder(holderAddress, chain string, holdings holdings, whales whales, coins coins) {
 	balances, err := apiClient.GetAddressBalances(apiclient.GetAddressBalancesReq{
 		Chain:   apiclient.Chain(chain),
 		Address: holderAddress,
@@ -156,11 +192,25 @@ func processHolder(holderAddress, chain string, holdings holdings, whales whales
 		if shouldSkipBalance(&balance) {
 			continue
 		}
-		if minHoldingUSDValue.LessThanOrEqual(quote) {
-			holdings.lock.Lock()
-			holdings.list[balance.ContractTickerSymbol] = struct{}{}
-			holdings.lock.Unlock()
+		if !minHoldingUSDValue.LessThanOrEqual(quote) {
+			continue
 		}
+		skip, err := shouldSkipToken(chain, balance.ContractTickerSymbol, coins)
+		if err != nil {
+			fmt.Printf("error checking for token skip: %s\n", err)
+			return
+		}
+		if skip {
+			continue
+		}
+
+		holdings.lock.Lock()
+		if v, ok := holdings.list[balance.ContractTickerSymbol]; ok {
+			holdings.list[balance.ContractTickerSymbol] = v.Add(quote)
+		} else {
+			holdings.list[balance.ContractTickerSymbol] = quote
+		}
+		holdings.lock.Unlock()
 	}
 	if !portfolioValue.LessThan(whaleThreshold) {
 		whales.lock.Lock()
@@ -175,52 +225,123 @@ type coingeckoCoin struct {
 	Platforms map[string]string `json:"platforms"`
 }
 
-func initCoingeckoTokensMap() {
-	fmt.Printf("Initializing coingecko tokens map...\n")
+type tokenInfo struct {
+	ID          string
+	Symbol      string
+	MarketCap   decimal.Decimal
+	GenesisDate string
+}
 
+func (t *tokenInfo) toCsvRow() []string {
+	return []string{t.ID, t.Symbol, t.MarketCap.String(), t.GenesisDate}
+}
+
+func httpGetCoingeckoTokensList() ([]coingeckoCoin, error) {
 	r, err := http.Get(coingeckoCoinsListURL)
 	if err != nil {
-		log.Fatalf("failure retrieving coingecko coins list: %s", err)
+		return nil, errors.Wrapf(err, "failure retrieving coingecko coins list")
 	}
 	defer r.Body.Close()
 
 	var coinsList []coingeckoCoin
 	jsonDataFromHttp, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		log.Fatalf("failure reading response body %s", err)
+		return nil, errors.Wrapf(err, "failure reading response body")
+	}
+	if r.StatusCode != 200 {
+		return nil, errors.Errorf("response status: %d; body: %s", r.StatusCode, string(jsonDataFromHttp))
 	}
 	if err := json.Unmarshal([]byte(jsonDataFromHttp), &coinsList); err != nil {
-		log.Fatalf("failure unmarshalling response body %s", err)
+		return nil, errors.Wrapf(err, "failure unmarshalling response body")
 	}
 
 	if len(coinsList) == 0 {
-		log.Fatalf("empty coingecko list")
+		return nil, errors.New("empty coingecko list")
 	}
 
+	return coinsList, nil
+}
+
+func httpGetCoingeckoTokenInfo(tokenID string) (*tokenInfo, error) {
+retry:
+	r, err := http.Get(fmt.Sprintf(coingeckoCoinURL, tokenID))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failure retrieving coingecko coin info")
+	}
+	defer r.Body.Close()
+
+	if r.StatusCode == 429 {
+		waitTime, err := time.ParseDuration(r.Header.Get("Retry-After") + "s")
+		if err != nil {
+			return nil, err
+		}
+		fmt.Println("coingecko rate limit reached. waiting " + r.Header.Get("Retry-After") + "s...")
+		time.Sleep(waitTime)
+		goto retry
+	}
+
+	var coinApiNativeInfo apiclient.CoingeckoCoinInfo
+	jsonDataFromHttp, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failure reading response body")
+	}
+	if err := json.Unmarshal([]byte(jsonDataFromHttp), &coinApiNativeInfo); err != nil {
+		return nil, errors.Wrapf(err, "failure unmarshalling response body")
+	}
+
+	return &tokenInfo{
+		ID:          coinApiNativeInfo.ID,
+		Symbol:      coinApiNativeInfo.Symbol,
+		GenesisDate: coinApiNativeInfo.GenesisDate,
+		MarketCap:   coinApiNativeInfo.MarketData.MarketCap.USD,
+	}, nil
+}
+
+func initCoingeckoTokensMap(coins coins) {
+	fmt.Printf("Initializing coingecko tokens map...\n")
+
+	coinsList, err := httpGetCoingeckoTokensList()
+	if err != nil {
+		log.Fatalf("failure getting coins list: %s", err.Error())
+	}
+
+	coins.lock.Lock()
+	defer coins.lock.Unlock()
+
 	for _, chain := range cfg.Chains {
-		coingeckoTokensMap[apiclient.Chain(chain)] = make(map[string]string)
+		coins.coingeckoTokensMap[apiclient.Chain(chain)] = make(map[string]*tokenInfo)
 	}
 
 	for _, coin := range coinsList {
+		if coin.ID == "" || coin.Symbol == "" {
+			continue
+		}
+
 		if strings.Contains(coin.ID, "wormhole") {
 			continue
 		}
-		if _, ok := coingeckoTokensMap[apiclient.ETH]; ok && len(coin.Platforms) == 0 {
-			coingeckoTokensMap[apiclient.ETH][coin.Symbol] = coin.ID
+
+		tokenInfo := &tokenInfo{
+			ID:     coin.ID,
+			Symbol: coin.Symbol,
+		}
+
+		if _, ok := coins.coingeckoTokensMap[apiclient.ETH]; ok && len(coin.Platforms) == 0 {
+			coins.coingeckoTokensMap[apiclient.ETH][coin.Symbol] = tokenInfo
 			continue
 		}
 		for _, chain := range cfg.Chains {
 			if _, ok := coin.Platforms[apiclient.CoingeckoPlatforms[apiclient.Chain(chain)]]; ok {
-				coingeckoTokensMap[apiclient.Chain(chain)][coin.Symbol] = coin.ID
+				coins.coingeckoTokensMap[apiclient.Chain(chain)][coin.Symbol] = tokenInfo
 			}
 		}
 	}
-	if len(coingeckoTokensMap) == 0 {
+	if len(coins.coingeckoTokensMap) == 0 {
 		log.Fatalf("empty coingecko tokens map")
 	}
 
-	fmt.Printf("tokens per chain in coingecko: ")
-	for k, v := range coingeckoTokensMap {
+	fmt.Printf("Tokens per chain in coingecko: ")
+	for k, v := range coins.coingeckoTokensMap {
 		fmt.Printf("%s : %d, ", k, len(v))
 	}
 	fmt.Println()
@@ -259,7 +380,7 @@ func saveFoundWhalesInAFile(whales map[string]string) {
 	}
 }
 
-func saveFoundTokensInAFile(chain string, tokens map[string]struct{}) {
+func saveFoundTokensInAFile(chain string, tokens map[string]decimal.Decimal, coins coins) {
 	if len(tokens) == 0 {
 		fmt.Printf("No tokens found for this chain\n")
 		return
@@ -267,6 +388,15 @@ func saveFoundTokensInAFile(chain string, tokens map[string]struct{}) {
 	filename := fmt.Sprintf("tokens_%s_%s_%s.csv", tokenSymbol, chain, time.Now().Format("2006-01-02"))
 
 	fmt.Printf("Found %d tokens. Saving results...\n", len(tokens))
+
+	// sort tokens by quote quantity in descending order
+	keys := make([]string, 0, len(tokens))
+	for key := range tokens {
+		keys = append(keys, key)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		return tokens[keys[i]].Cmp(tokens[keys[j]]) > 0
+	})
 
 	f, err := os.Create(fmt.Sprintf("%s/%s", resultsPathTokens, filename))
 	if err != nil {
@@ -280,12 +410,19 @@ func saveFoundTokensInAFile(chain string, tokens map[string]struct{}) {
 		log.Fatalln("error writing headers to csv file:", err)
 	}
 
-	for k := range tokens {
+	coins.lock.RLock()
+	for _, k := range keys {
+		var coinID string
+		if coinInfo, ok := coins.coingeckoTokensMap[apiclient.Chain(chain)][strings.ToLower(k)]; ok {
+			coinID = coinInfo.ID
+		}
+
 		if err := w.Write([]string{k,
-			fmt.Sprintf(coingeckoURL, coingeckoTokensMap[apiclient.Chain(chain)][strings.ToLower(k)])}); err != nil {
+			fmt.Sprintf(coingeckoURL, coinID)}); err != nil {
 			log.Fatalln("error writing tokens list to csv file:", err)
 		}
 	}
+	coins.lock.RUnlock()
 	w.Flush()
 
 	err = f.Close()
@@ -315,6 +452,52 @@ func shouldSkipHolder(holder *class_a.Portfolio) bool {
 	return holderBalance.LessThan(decimal.NewFromInt(int64(minTokenQnt)))
 }
 
+func shouldSkipToken(chain string, tokenSymbol string, coins coins) (bool, error) {
+	coins.lock.Lock()
+	defer coins.lock.Unlock()
+
+	tokenInfo, ok := coins.coingeckoTokensMap[apiclient.Chain(chain)][strings.ToLower(tokenSymbol)]
+	if !ok {
+		return true, nil
+	}
+
+	if tokenInfo.ID == "" {
+		return true, nil
+	}
+
+	if tokenInfo.MarketCap.Equals(decimal.Decimal{}) {
+		coinGeckoTokenInfo, err := httpGetCoingeckoTokenInfo(tokenInfo.ID)
+		if err != nil {
+			return false, errors.Wrapf(err, "failure getting coin info for coin ID: %s", tokenInfo.ID)
+		}
+
+		coins.coingeckoTokensMap[apiclient.Chain(chain)][strings.ToLower(tokenSymbol)] = coinGeckoTokenInfo
+		tokenInfo = coinGeckoTokenInfo
+
+		fmt.Printf("symbol: %s, tokenInfo: %+v\n", tokenSymbol, tokenInfo)
+	}
+
+	// TO ADD:
+	// - price metrics e.g. not an inverted exponential curve, not around ATH
+
+	if tokenInfo.MarketCap.GreaterThan(decimal.NewFromInt(50000000)) {
+		return true, nil
+	}
+
+	if tokenInfo.GenesisDate != "" {
+		genesisDate, err := time.Parse("2006-01-02", tokenInfo.GenesisDate)
+		if err != nil {
+			return false, err
+		}
+		limitDate, _ := time.Parse("2006-01-02", "2022-04-01")
+		if genesisDate.Before(limitDate) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func shortValue(value decimal.Decimal) string {
 	million := decimal.NewFromInt(1000000)
 	thousand := decimal.NewFromInt(1000)
@@ -327,32 +510,6 @@ func shortValue(value decimal.Decimal) string {
 	return value.Div(thousand).RoundCash(100).String() + "K"
 }
 
-// func printOutput(chain string, holdings map[string]struct{}, whales map[string]string) {
-// 	var holdingsStr strings.Builder
-// 	holdingsStr.Grow(len(holdings) * 8)
-// 	for k := range holdings {
-// 		holdingsStr.WriteString(fmt.Sprintf("%s, ", k))
-// 	}
-// 	var whalesStr strings.Builder
-// 	whalesStr.Grow(len(whales) * 8)
-// 	for k, v := range whales {
-// 		whalesStr.WriteString(fmt.Sprintf("%s:%s, ", k, v))
-// 	}
-
-// 	fmt.Println()
-// 	fmt.Println()
-// 	fmt.Println("******************************************************")
-// 	fmt.Printf("Chain: %s", chain)
-// 	fmt.Println()
-// 	fmt.Printf("Tokens: %s", holdingsStr.String())
-// 	fmt.Println()
-// 	fmt.Printf("Whales: %s", whalesStr.String())
-// 	fmt.Println()
-// 	fmt.Println("******************************************************")
-// 	fmt.Println()
-// 	fmt.Println()
-// }
-
 func initConfig(cfgFilepath string) {
 	viper.SetConfigFile(cfgFilepath)
 
@@ -364,5 +521,46 @@ func initConfig(cfgFilepath string) {
 
 	if err := viper.GetViper().Unmarshal(&cfg); err != nil {
 		log.Fatalf("error unmarshalling config: %v", err)
+	}
+}
+
+func saveCoingeckoTokensList(coins coins) {
+	initCoingeckoTokensMap(coins)
+
+	coins.lock.Lock()
+	defer coins.lock.Unlock()
+
+	f, err := os.Create("tokenslist.csv")
+	if err != nil {
+		log.Fatalln("failed to create file:", err)
+	}
+
+	w := csv.NewWriter(f)
+
+	err = w.Write([]string{"id", "symbol", "marketcap", "genesis date"})
+	if err != nil {
+		log.Fatalln("error writing headers to csv file:", err)
+	}
+
+	for chain := range coins.coingeckoTokensMap {
+		for coinSymbol := range coins.coingeckoTokensMap[chain] {
+			tokenInfo := coins.coingeckoTokensMap[chain][coinSymbol]
+			coinGeckoTokenInfo, err := httpGetCoingeckoTokenInfo(tokenInfo.ID)
+			if err != nil {
+				log.Fatalf("failure getting coin info for coin ID: %s, err: %s", tokenInfo.ID, err)
+			}
+
+			if err := w.Write(coinGeckoTokenInfo.toCsvRow()); err != nil {
+				log.Fatalln("error writing token info to csv file:", err)
+			}
+			w.Flush()
+		}
+	}
+
+	w.Flush()
+
+	err = f.Close()
+	if err != nil {
+		log.Fatalln("error closing file:", err)
 	}
 }
